@@ -1,0 +1,319 @@
+name: Build Osher Keyboard APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p $HOME/osher && cd $HOME/osher
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'OSHEREOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.osher.keyboard"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.osher.keyboard"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'OSHEREOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/sym_def_app_icon">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OsherKeyboardService"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_INPUT_METHOD"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data android:name="android.view.im" android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/java/com/osher/keyboard/MainActivity.kt)
+          cat > app/src/main/java/com/osher/keyboard/MainActivity.kt <<'OSHEREOF'
+          package com.osher.keyboard
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  root.addView(TextView(this).apply { text = "Osher Keyboard"; textSize = 28f })
+                  root.addView(Button(this).apply {
+                      text = "1. Enable Osher Keyboard"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "2. Switch to Osher Keyboard"
+                      setOnClickListener {
+                          (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                      }
+                  })
+                  root.addView(EditText(this).apply { hint = "3. Tap here to test" })
+                  setContentView(root)
+              }
+          }
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/java/com/osher/keyboard/OsherKeyboardService.kt)
+          cat > app/src/main/java/com/osher/keyboard/OsherKeyboardService.kt <<'OSHEREOF'
+          package com.osher.keyboard
+
+          import android.inputmethodservice.InputMethodService
+          import android.view.KeyEvent
+          import android.view.View
+
+          class OsherKeyboardService : InputMethodService() {
+
+              override fun onCreateInputView(): View = OsherKeyboardView(this, ::onKeyPress)
+
+              private fun onKeyPress(key: String) {
+                  val ic = currentInputConnection ?: return
+                  when (key) {
+                      "DEL" -> ic.deleteSurroundingText(1, 0)
+                      "ENTER" -> {
+                          ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                          ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+                      }
+                      else -> ic.commitText(key, 1)
+                  }
+              }
+          }
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/java/com/osher/keyboard/OsherKeyboardView.kt)
+          cat > app/src/main/java/com/osher/keyboard/OsherKeyboardView.kt <<'OSHEREOF'
+          package com.osher.keyboard
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.view.MotionEvent
+          import android.view.View
+
+          class OsherKeyboardView(
+              context: Context,
+              private val onKey: (String) -> Unit
+          ) : View(context) {
+
+              private class Key(val label: String, val action: String, val weight: Float = 1f) {
+                  val rect = RectF()
+              }
+
+              // ^ = shift, < = backspace
+              private val letterRows = listOf("qwertyuiop", "asdfghjkl", "^zxcvbnm<")
+              private val symbolRows = listOf("1234567890", "@#$%&-+()/", "~*\"':;!?<")
+
+              private var shift = false
+              private var symbols = false
+              private var rows: List<List<Key>> = build()
+              private var pressed: Key? = null
+              private val d = resources.displayMetrics.density
+
+              private val bgPaint = Paint().apply { color = 0xFF0F1720.toInt() }
+              private val watermark = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0x33FFFFFF
+                  textAlign = Paint.Align.CENTER
+                  isFakeBoldText = true
+              }
+              private val keyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xB02A3644.toInt() }
+              private val specialPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xB01B2530.toInt() }
+              private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF3D8BFD.toInt() }
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0xFFFFFFFF.toInt()
+                  textAlign = Paint.Align.CENTER
+                  textSize = 20f * d
+              }
+
+              private fun build(): List<List<Key>> {
+                  val src = if (symbols) symbolRows else letterRows
+                  val main = src.map { row ->
+                      row.map { c ->
+                          when (c) {
+                              '^' -> Key("⇧", "SHIFT", 1.5f)
+                              '<' -> Key("⌫", "DEL", 1.5f)
+                              else -> Key(c.toString(), c.toString())
+                          }
+                      }
+                  }
+                  val bottom = listOf(
+                      Key(if (symbols) "ABC" else "?123", "MODE", 1.5f),
+                      Key(",", ","),
+                      Key("osher", " ", 5f),
+                      Key(".", "."),
+                      Key("⏎", "ENTER", 1.5f)
+                  )
+                  return main + listOf(bottom)
+              }
+
+              private fun layout() {
+                  val gap = 3f * d
+                  val rowH = height / rows.size.toFloat()
+                  rows.forEachIndexed { i, row ->
+                      val unit = width / row.sumOf { it.weight.toDouble() }.toFloat()
+                      var x = 0f
+                      row.forEach { k ->
+                          val w = unit * k.weight
+                          k.rect.set(x + gap, i * rowH + gap, x + w - gap, (i + 1) * rowH - gap)
+                          x += w
+                      }
+                  }
+              }
+
+              override fun onMeasure(w: Int, h: Int) {
+                  setMeasuredDimension(resolveSize(0, w), (250 * d).toInt())
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) = layout()
+
+              override fun onDraw(c: Canvas) {
+                  c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+
+                  // "osher" on the keyboard background
+                  watermark.textSize = height * 0.5f
+                  val y = height / 2f - (watermark.descent() + watermark.ascent()) / 2f
+                  c.drawText("osher", width / 2f, y, watermark)
+
+                  val r = 8f * d
+                  val ty = -(textPaint.descent() + textPaint.ascent()) / 2f
+                  rows.flatten().forEach { k ->
+                      val paint = when {
+                          k === pressed -> pressedPaint
+                          k.action.length > 1 && k.action != "MODE" || k.action == "MODE" -> specialPaint
+                          else -> keyPaint
+                      }
+                      c.drawRoundRect(k.rect, r, r, paint)
+                      val label = if (shift && !symbols && k.label.length == 1 && k.label[0].isLetter())
+                          k.label.uppercase() else k.label
+                      c.drawText(label, k.rect.centerX(), k.rect.centerY() + ty, textPaint)
+                  }
+              }
+
+              private fun keyAt(x: Float, y: Float) =
+                  rows.flatten().firstOrNull { it.rect.contains(x, y) }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                          pressed = keyAt(e.x, e.y); invalidate()
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          keyAt(e.x, e.y)?.let { handle(it) }
+                          pressed = null; invalidate()
+                      }
+                      MotionEvent.ACTION_CANCEL -> { pressed = null; invalidate() }
+                  }
+                  return true
+              }
+
+              private fun handle(k: Key) {
+                  when (k.action) {
+                      "SHIFT" -> shift = !shift
+                      "MODE" -> { symbols = !symbols; rows = build(); layout() }
+                      else -> {
+                          val a = k.action
+                          onKey(if (shift && a.length == 1 && a[0].isLetter()) a.uppercase() else a)
+                          shift = false
+                      }
+                  }
+              }
+          }
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'OSHEREOF'
+          <resources>
+              <string name="app_name">Osher Keyboard</string>
+          </resources>
+          OSHEREOF
+          mkdir -p $(dirname app/src/main/res/xml/method.xml)
+          cat > app/src/main/res/xml/method.xml <<'OSHEREOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android">
+              <subtype
+                  android:label="English"
+                  android:imeSubtypeLocale="en_US"
+                  android:imeSubtypeMode="keyboard" />
+          </input-method>
+          OSHEREOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'OSHEREOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          OSHEREOF
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'OSHEREOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "OsherKeyboard"
+          include(":app")
+          OSHEREOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'OSHEREOF'
+          org.gradle.jvmargs=-Xmx2g
+          OSHEREOF
+      - name: Build APK
+        working-directory: /home/runner/osher
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OsherKeyboard-apk
+          path: /home/runner/osher/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Osher Keyboard APK ${{ github.run_number }}
+          files: /home/runner/osher/app/build/outputs/apk/debug/app-debug.apk
